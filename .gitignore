@@ -50,3 +50,15 @@ pretrained_models/*
 *_pb2_grpc.py
 *_pb2.py
 *.tar
+
+# CosyVoice-CLI outputs
+**/output_*.wav
+**/*__ref_16k_mono.wav
+**/*__trimmed_*.wav
+**/reference_text.txt
+**/reference_text.meta.json
+
+# Common model / cache dirs
+.cache/
+__pycache__/
+*.pyc

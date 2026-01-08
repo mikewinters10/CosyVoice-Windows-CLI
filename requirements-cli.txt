@@ -1,0 +1,8 @@
+# CLI additions on top of upstream CosyVoice requirements
+-r requirements.txt
+
+# Automatic reference transcription (default backend)
+faster-whisper>=1.0.3
+
+# If you prefer the original OpenAI Whisper python package as a fallback,
+# it's already included in requirements.txt as "openai-whisper".
