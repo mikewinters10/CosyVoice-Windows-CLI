@@ -1,0 +1,4 @@
+V1: Hey there! It’s good to hear from you.
+V2: Hi! I’ve been looking forward to catching up.
+V1: Same here. Want to grab coffee later?
+V2: Absolutely. Let’s do it.

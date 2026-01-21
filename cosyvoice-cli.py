@@ -10,6 +10,9 @@ Goals
 
 Windows / Anaconda Prompt example
   python cosyvoice_cli.py --text "Hello world" --reference "C:\\path\\to\\ref.wav"
+
+Two-voice example
+  python cosyvoice-cli-twovoice.py --reference "C:\\path\\to\\v1.wav" --reference2 "C:\\path\\to\\v2.wav"
 """
 
 from __future__ import annotations
@@ -303,8 +306,12 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
-    parser.add_argument("--text", required=True, help='Text to speak, e.g. "Hello world!"')
+    parser.add_argument("--text", help='Text to speak, e.g. "Hello world!"')
     parser.add_argument("--reference", required=True, help="Path to reference speaker WAV file.")
+    parser.add_argument(
+        "--reference2",
+        help="Optional path to a second reference speaker WAV file for two-voice scripts.",
+    )
 
     parser.add_argument(
         "--model_dir",
@@ -333,6 +340,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--transcript_file",
         default="reference_text.txt",
         help="Cached transcript filename inside the output folder.",
+    )
+    parser.add_argument(
+        "--transcript_file2",
+        default="reference2_text.txt",
+        help="Cached transcript filename for the second voice inside the output folder.",
     )
 
     # How much of the transcript to include in the *prompt*.
@@ -385,8 +397,111 @@ def build_parser() -> argparse.ArgumentParser:
     # Playback
     parser.add_argument("--no_play", action="store_true", help="Disable auto-play in VLC.")
     parser.add_argument("--vlc", default=None, help=r"Optional full path to vlc.exe")
+    parser.add_argument(
+        "--silence_ms",
+        type=int,
+        default=350,
+        help="Silence padding (ms) inserted between utterances when using scripts.",
+    )
 
     return parser
+
+
+def _load_script_text(text_arg: Optional[str]) -> str:
+    if text_arg and text_arg.strip():
+        return text_arg.strip()
+
+    script_path = _repo_root() / "voice_script.txt"
+    if not script_path.exists():
+        raise FileNotFoundError(
+            f"No --text provided and default script not found: {script_path}.\n"
+            "Create voice_script.txt or pass --text."
+        )
+    return script_path.read_text(encoding="utf-8").strip()
+
+
+def _parse_script(text: str, has_voice2: bool) -> list[tuple[int, str]]:
+    """Return a list of (voice_index, utterance) tuples."""
+    cleaned = text.strip()
+    if not cleaned:
+        raise ValueError("Script text is empty.")
+
+    if not has_voice2:
+        return [(1, cleaned)]
+
+    lines = cleaned.splitlines()
+    segments: list[tuple[int, str]] = []
+    current_voice: Optional[int] = None
+    buffer: list[str] = []
+
+    def flush() -> None:
+        nonlocal buffer, current_voice
+        if current_voice is None:
+            return
+        merged = " ".join(" ".join(buffer).split()).strip()
+        if merged:
+            segments.append((current_voice, merged))
+        buffer = []
+
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("V1:"):
+            flush()
+            current_voice = 1
+            buffer.append(stripped[3:].strip())
+            continue
+        if stripped.startswith("V2:"):
+            flush()
+            current_voice = 2
+            buffer.append(stripped[3:].strip())
+            continue
+        buffer.append(stripped)
+
+    flush()
+
+    if not any(seg[0] == 1 for seg in segments):
+        return [(1, cleaned)]
+
+    return segments
+
+
+def _build_prompt(reference_text: Optional[str], prompt_prefix: str, max_words: int) -> str:
+    if reference_text:
+        print(
+            f"[INFO] Using reference_text (truncated): {reference_text[:120]}{'...' if len(reference_text) > 120 else ''}"
+        )
+        print(f"[INFO] Prompt ref words used: {max_words}")
+        return f"{prompt_prefix}<|endofprompt|>{reference_text}"
+
+    print(
+        "[WARN] reference_text unavailable. Cloning can work, but speaker similarity may be worse.\n"
+        "       (Auto transcription failed or was disabled.)"
+    )
+    return "<|endofprompt|>"
+
+
+def _generate_audio(
+    cosyvoice: AutoModel,
+    text: str,
+    prompt_text: str,
+    ref_for_model: Path,
+) -> torch.Tensor:
+    chunks: list[torch.Tensor] = []
+    for out in cosyvoice.inference_zero_shot(
+        text,
+        prompt_text,
+        str(ref_for_model),
+        stream=False,
+    ):
+        speech = out.get("tts_speech")
+        if speech is not None:
+            chunks.append(speech)
+    return concat_audio_chunks(chunks)
+
+
+def _silence(sample_rate: int, silence_ms: int) -> torch.Tensor:
+    silence_samples = int(sample_rate * max(silence_ms, 0) / 1000.0)
+    return torch.zeros(1, silence_samples)
 
 
 def main() -> None:
@@ -395,6 +510,12 @@ def main() -> None:
     reference_wav = Path(args.reference).expanduser().resolve()
     if not reference_wav.exists():
         raise FileNotFoundError(f"Reference WAV not found: {reference_wav}")
+
+    reference_wav2 = None
+    if args.reference2:
+        reference_wav2 = Path(args.reference2).expanduser().resolve()
+        if not reference_wav2.exists():
+            raise FileNotFoundError(f"Reference WAV 2 not found: {reference_wav2}")
 
     model_dir = Path(args.model_dir).expanduser().resolve()
     if not model_dir.exists():
@@ -407,6 +528,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     out_wav = out_dir / f"output_{timestamp_yyMMdd_hhmmss()}.wav"
+
+    script_text = _load_script_text(args.text)
+    script_segments = _parse_script(script_text, has_voice2=reference_wav2 is not None)
 
     # CosyVoice hard-requires <= 30s for zero-shot token extraction.
     # We also always convert to 16kHz mono.
@@ -425,37 +549,52 @@ def main() -> None:
         force_retranscribe=bool(args.force_retranscribe),
     )
 
-    # Keep prompt short unless we have a (short) transcript.
-    if reference_text:
-        prompt_text = f"{args.prompt_prefix}<|endofprompt|>{reference_text}"
-        print(f"[INFO] Using reference_text (truncated): {reference_text[:120]}{'...' if len(reference_text) > 120 else ''}")
-        print(f"[INFO] Prompt ref words used: {args.max_transcript_words}")
-    else:
-        prompt_text = "<|endofprompt|>"
-        print(
-            "[WARN] reference_text unavailable. Cloning can work, but speaker similarity may be worse.\n"
-            "       (Auto transcription failed or was disabled.)"
+    prompt_text = _build_prompt(reference_text, args.prompt_prefix, args.max_transcript_words)
+
+    ref_for_model2 = None
+    prompt_text2 = None
+    if reference_wav2:
+        ref_for_model2 = prepare_reference_audio(reference_wav2, out_dir, max_seconds=float(args.max_ref_seconds))
+        reference_text2 = load_or_create_reference_text(
+            out_dir=out_dir,
+            ref_for_model=ref_for_model2,
+            transcript_filename=args.transcript_file2,
+            auto_transcribe=(not args.no_auto_transcribe),
+            asr_engine=args.asr_engine,
+            asr_model=args.asr_model,
+            asr_device=args.asr_device,
+            asr_compute_type=args.asr_compute_type,
+            max_transcript_words=int(args.max_transcript_words),
+            force_retranscribe=bool(args.force_retranscribe),
         )
+        prompt_text2 = _build_prompt(reference_text2, args.prompt_prefix, args.max_transcript_words)
 
     print(f"[INFO] Reference WAV:  {reference_wav}")
     print(f"[INFO] Using ref WAV:  {ref_for_model}")
+    if reference_wav2:
+        print(f"[INFO] Reference2 WAV: {reference_wav2}")
+        print(f"[INFO] Using ref2 WAV: {ref_for_model2}")
     print(f"[INFO] Model dir:      {model_dir}")
     print(f"[INFO] Output path:    {out_wav}")
 
     cosyvoice = AutoModel(model_dir=str(model_dir))
 
-    chunks: list[torch.Tensor] = []
-    for out in cosyvoice.inference_zero_shot(
-        args.text,
-        prompt_text,
-        str(ref_for_model),
-        stream=False,
-    ):
-        speech = out.get("tts_speech")
-        if speech is not None:
-            chunks.append(speech)
+    silence_chunk = _silence(cosyvoice.sample_rate, args.silence_ms)
+    output_chunks: list[torch.Tensor] = []
 
-    audio = concat_audio_chunks(chunks)
+    for idx, (voice_idx, utterance) in enumerate(script_segments, start=1):
+        if voice_idx == 2 and not (ref_for_model2 and prompt_text2):
+            raise RuntimeError("Script references V2, but no --reference2 was provided.")
+
+        active_ref = ref_for_model if voice_idx == 1 else ref_for_model2
+        active_prompt = prompt_text if voice_idx == 1 else prompt_text2
+
+        print(f"[INFO] Synthesizing turn {idx} (V{voice_idx}): {utterance[:60]}")
+        output_chunks.append(_generate_audio(cosyvoice, utterance, active_prompt, active_ref))
+        if idx < len(script_segments) and silence_chunk.numel() > 0:
+            output_chunks.append(silence_chunk)
+
+    audio = concat_audio_chunks(output_chunks)
     torchaudio.save(str(out_wav), audio, cosyvoice.sample_rate)
 
     if not out_wav.exists():
