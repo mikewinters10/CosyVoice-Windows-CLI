@@ -92,6 +92,39 @@ def decode_to_wav_with_ffmpeg(src: Path, out_wav: Path) -> Path:
     return out_wav
 
 
+def replace_audio_in_mp4(src_mp4: Path, audio_wav: Path, out_mp4: Path) -> None:
+    """Replace audio track in an MP4, preserving video, and write to out_mp4."""
+    ffmpeg = _ffmpeg_path()
+    out_mp4.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src_mp4),
+        "-i",
+        str(audio_wav),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-map_metadata",
+        "0",
+        "-map_chapters",
+        "0",
+        "-c:v",
+        "copy",
+        "-c:a",
+        "aac",
+        "-shortest",
+        str(out_mp4),
+    ]
+    subprocess.run(cmd, check=True)
+
+
 def ensure_wav_16k_mono(wav_path: Path) -> tuple[torch.Tensor, int]:
     """Load audio and return mono 16kHz tensor shaped [1, T]."""
     audio, sr = torchaudio.load(str(wav_path))  # [C, T]
@@ -616,12 +649,15 @@ def main() -> None:
     out_dir = Path(args.out_dir).expanduser().resolve() if args.out_dir else output_dir_for_reference(reference_wav)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    out_wav = out_dir / f"output_{timestamp_yyMMdd_hhmmss()}.wav"
+    run_stamp = timestamp_yyMMdd_hhmmss()
+    out_wav = out_dir / f"output_{run_stamp}.wav"
+    final_output_path: Optional[Path] = None
 
     if args.target:
         target_audio = Path(args.target).expanduser().resolve()
         if not target_audio.exists():
             raise FileNotFoundError(f"Target audio not found: {target_audio}")
+        target_is_mp4 = target_audio.suffix.lower() == ".mp4"
 
         ref_for_model = ensure_16k_mono_on_disk(
             reference_wav,
@@ -640,7 +676,11 @@ def main() -> None:
         print(f"[INFO] Target audio:  {target_audio}")
         print(f"[INFO] Using target: {target_for_model}")
         print(f"[INFO] Model dir:    {model_dir}")
-        print(f"[INFO] Output path:  {out_wav}")
+        if target_is_mp4:
+            final_output_path = target_audio.parent / f"{target_audio.stem}_{run_stamp}.mp4"
+        else:
+            final_output_path = out_wav
+        print(f"[INFO] Output path:  {final_output_path}")
 
         cosyvoice = AutoModel(model_dir=str(model_dir))
         vc_chunks: list[torch.Tensor] = []
@@ -650,7 +690,19 @@ def main() -> None:
                 vc_chunks.append(speech)
 
         audio = concat_audio_chunks(vc_chunks)
-        torchaudio.save(str(out_wav), audio, cosyvoice.sample_rate)
+        if target_is_mp4:
+            tmp_processed_wav = out_dir / f"{target_audio.stem}__processed_{run_stamp}.wav"
+            torchaudio.save(str(tmp_processed_wav), audio, cosyvoice.sample_rate)
+            try:
+                replace_audio_in_mp4(target_audio, tmp_processed_wav, final_output_path)
+            finally:
+                if tmp_processed_wav.exists():
+                    try:
+                        tmp_processed_wav.unlink()
+                    except OSError:
+                        pass
+        else:
+            torchaudio.save(str(final_output_path), audio, cosyvoice.sample_rate)
     else:
         script_text = _load_script_text(args.text)
         script_segments = _parse_script(script_text, has_voice2=reference_wav2 is not None)
@@ -719,14 +771,15 @@ def main() -> None:
 
         audio = concat_audio_chunks(output_chunks)
         torchaudio.save(str(out_wav), audio, cosyvoice.sample_rate)
+        final_output_path = out_wav
 
-    if not out_wav.exists():
-        raise RuntimeError(f"Output file was not created: {out_wav}")
+    if not final_output_path or not final_output_path.exists():
+        raise RuntimeError(f"Output file was not created: {final_output_path}")
 
-    print(f"Created: {out_wav}")
+    print(f"Created: {final_output_path}")
 
     if not args.no_play:
-        play_in_vlc(out_wav, vlc_path=args.vlc)
+        play_in_vlc(final_output_path, vlc_path=args.vlc)
 
 
 if __name__ == "__main__":
