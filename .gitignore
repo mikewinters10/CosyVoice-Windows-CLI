@@ -62,3 +62,7 @@ pretrained_models/*
 .cache/
 __pycache__/
 *.pyc
+
+# Privacy-sensitive files
+voice_script.txt
+Voice-Scripts/

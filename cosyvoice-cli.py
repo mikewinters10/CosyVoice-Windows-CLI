@@ -3,10 +3,10 @@
 A small, reproducible command-line wrapper around CosyVoice3 zero-shot voice cloning.
 
 Goals
-- User provides: (text, reference wav)
+- User provides: (text, reference wav) or (target audio, reference wav) for voice conversion
 - Script ensures the reference is 16 kHz mono and <= 30s
 - Script auto-transcribes the reference (faster-whisper by default) into reference_text.txt
-- Script runs CosyVoice zero-shot inference and writes an output WAV next to the reference
+- Script runs CosyVoice zero-shot inference (text mode) or voice conversion (target mode)
 
 Windows / Anaconda Prompt example
   python cosyvoice_cli.py --text "Hello world" --reference "C:\\path\\to\\ref.wav"
@@ -53,6 +53,45 @@ def output_dir_for_reference(reference_wav: Path) -> Path:
     return out_dir
 
 
+def _ffmpeg_path() -> str:
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    candidates = [
+        r"C:\\Program Files\\ffmpeg\\bin\\ffmpeg.exe",
+        r"C:\\ffmpeg\\bin\\ffmpeg.exe",
+    ]
+    for candidate in candidates:
+        if Path(candidate).exists():
+            return candidate
+    raise FileNotFoundError(
+        "ffmpeg not found. Install ffmpeg and make sure ffmpeg.exe is on PATH.\n"
+        "Try: winget install Gyan.FFmpeg  (then reopen your terminal)"
+    )
+
+
+def decode_to_wav_with_ffmpeg(src: Path, out_wav: Path) -> Path:
+    """Decode arbitrary audio to a WAV file via ffmpeg."""
+    ffmpeg = _ffmpeg_path()
+    out_wav.parent.mkdir(parents=True, exist_ok=True)
+
+    cmd = [
+        ffmpeg,
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(src),
+        "-vn",
+        "-acodec",
+        "pcm_s16le",
+        str(out_wav),
+    ]
+    subprocess.run(cmd, check=True)
+    return out_wav
+
+
 def ensure_wav_16k_mono(wav_path: Path) -> tuple[torch.Tensor, int]:
     """Load audio and return mono 16kHz tensor shaped [1, T]."""
     audio, sr = torchaudio.load(str(wav_path))  # [C, T]
@@ -71,6 +110,46 @@ def ensure_wav_16k_mono(wav_path: Path) -> tuple[torch.Tensor, int]:
         audio = audio.unsqueeze(0)
 
     return audio, sr
+
+
+def ensure_16k_mono_on_disk(src: Path, out: Path, max_seconds: float) -> Path:
+    """Normalize audio to 16 kHz mono WAV on disk, trimming to max_seconds."""
+    src = src.expanduser().resolve()
+    out = out.expanduser().resolve()
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    tmp_wav = out.with_suffix(".tmp_decode.wav")
+
+    try:
+        if src.suffix.lower() == ".wav":
+            wav_path = src
+        else:
+            wav_path = decode_to_wav_with_ffmpeg(src, tmp_wav)
+
+        wav, sr = torchaudio.load(str(wav_path))
+        wav = wav.to(torch.float32)
+
+        if wav.dim() == 2 and wav.size(0) > 1:
+            wav = wav.mean(dim=0, keepdim=True)
+
+        if sr != 16000:
+            wav = torchaudio.functional.resample(wav, sr, 16000)
+            sr = 16000
+
+        if max_seconds is not None and max_seconds > 0:
+            max_samples = int(sr * float(max_seconds))
+            if wav.shape[1] > max_samples:
+                wav = wav[:, :max_samples]
+                print(f"[INFO] Cropped {src.name} to first {max_seconds:.1f}s for token extraction.")
+
+        torchaudio.save(str(out), wav, sr)
+        return out
+    finally:
+        if tmp_wav.exists():
+            try:
+                tmp_wav.unlink()
+            except OSError:
+                pass
 
 
 def sha256_file(path: Path) -> str:
@@ -302,7 +381,7 @@ def play_in_vlc(wav_path: Path, vlc_path: Optional[str] = None) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="CosyVoice3 CLI wrapper: synthesize speech from text + reference wav.",
+        description="CosyVoice3 CLI wrapper: synthesize speech from text + reference wav, or voice conversion.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
@@ -311,6 +390,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reference2",
         help="Optional path to a second reference speaker WAV file for two-voice scripts.",
+    )
+    parser.add_argument(
+        "--target",
+        help="Path to target audio for voice conversion (requires --reference, incompatible with --reference2).",
     )
 
     parser.add_argument(
@@ -511,6 +594,12 @@ def main() -> None:
     if not reference_wav.exists():
         raise FileNotFoundError(f"Reference WAV not found: {reference_wav}")
 
+    if args.target and args.text:
+        raise ValueError("--target cannot be used with --text (voice conversion mode).")
+
+    if args.target and args.reference2:
+        raise ValueError("--target cannot be used with --reference2.")
+
     reference_wav2 = None
     if args.reference2:
         reference_wav2 = Path(args.reference2).expanduser().resolve()
@@ -529,36 +618,51 @@ def main() -> None:
 
     out_wav = out_dir / f"output_{timestamp_yyMMdd_hhmmss()}.wav"
 
-    script_text = _load_script_text(args.text)
-    script_segments = _parse_script(script_text, has_voice2=reference_wav2 is not None)
+    if args.target:
+        target_audio = Path(args.target).expanduser().resolve()
+        if not target_audio.exists():
+            raise FileNotFoundError(f"Target audio not found: {target_audio}")
 
-    # CosyVoice hard-requires <= 30s for zero-shot token extraction.
-    # We also always convert to 16kHz mono.
-    ref_for_model = prepare_reference_audio(reference_wav, out_dir, max_seconds=float(args.max_ref_seconds))
+        ref_for_model = ensure_16k_mono_on_disk(
+            reference_wav,
+            out_dir / f"{reference_wav.stem}__ref_16k_mono.wav",
+            max_seconds=float(args.max_ref_seconds),
+        )
+        target_for_model = ensure_16k_mono_on_disk(
+            target_audio,
+            out_dir / f"{target_audio.stem}__target_16k_mono.wav",
+            max_seconds=float(args.max_ref_seconds),
+        )
 
-    reference_text = load_or_create_reference_text(
-        out_dir=out_dir,
-        ref_for_model=ref_for_model,
-        transcript_filename=args.transcript_file,
-        auto_transcribe=(not args.no_auto_transcribe),
-        asr_engine=args.asr_engine,
-        asr_model=args.asr_model,
-        asr_device=args.asr_device,
-        asr_compute_type=args.asr_compute_type,
-        max_transcript_words=int(args.max_transcript_words),
-        force_retranscribe=bool(args.force_retranscribe),
-    )
+        print("[INFO] Voice conversion mode.")
+        print(f"[INFO] Reference WAV: {reference_wav}")
+        print(f"[INFO] Using ref WAV: {ref_for_model}")
+        print(f"[INFO] Target audio:  {target_audio}")
+        print(f"[INFO] Using target: {target_for_model}")
+        print(f"[INFO] Model dir:    {model_dir}")
+        print(f"[INFO] Output path:  {out_wav}")
 
-    prompt_text = _build_prompt(reference_text, args.prompt_prefix, args.max_transcript_words)
+        cosyvoice = AutoModel(model_dir=str(model_dir))
+        vc_chunks: list[torch.Tensor] = []
+        for out in cosyvoice.inference_vc(str(target_for_model), str(ref_for_model), stream=False):
+            speech = out.get("tts_speech")
+            if speech is not None:
+                vc_chunks.append(speech)
 
-    ref_for_model2 = None
-    prompt_text2 = None
-    if reference_wav2:
-        ref_for_model2 = prepare_reference_audio(reference_wav2, out_dir, max_seconds=float(args.max_ref_seconds))
-        reference_text2 = load_or_create_reference_text(
+        audio = concat_audio_chunks(vc_chunks)
+        torchaudio.save(str(out_wav), audio, cosyvoice.sample_rate)
+    else:
+        script_text = _load_script_text(args.text)
+        script_segments = _parse_script(script_text, has_voice2=reference_wav2 is not None)
+
+        # CosyVoice hard-requires <= 30s for zero-shot token extraction.
+        # We also always convert to 16kHz mono.
+        ref_for_model = prepare_reference_audio(reference_wav, out_dir, max_seconds=float(args.max_ref_seconds))
+
+        reference_text = load_or_create_reference_text(
             out_dir=out_dir,
-            ref_for_model=ref_for_model2,
-            transcript_filename=args.transcript_file2,
+            ref_for_model=ref_for_model,
+            transcript_filename=args.transcript_file,
             auto_transcribe=(not args.no_auto_transcribe),
             asr_engine=args.asr_engine,
             asr_model=args.asr_model,
@@ -567,35 +671,54 @@ def main() -> None:
             max_transcript_words=int(args.max_transcript_words),
             force_retranscribe=bool(args.force_retranscribe),
         )
-        prompt_text2 = _build_prompt(reference_text2, args.prompt_prefix, args.max_transcript_words)
 
-    print(f"[INFO] Reference WAV:  {reference_wav}")
-    print(f"[INFO] Using ref WAV:  {ref_for_model}")
-    if reference_wav2:
-        print(f"[INFO] Reference2 WAV: {reference_wav2}")
-        print(f"[INFO] Using ref2 WAV: {ref_for_model2}")
-    print(f"[INFO] Model dir:      {model_dir}")
-    print(f"[INFO] Output path:    {out_wav}")
+        prompt_text = _build_prompt(reference_text, args.prompt_prefix, args.max_transcript_words)
 
-    cosyvoice = AutoModel(model_dir=str(model_dir))
+        ref_for_model2 = None
+        prompt_text2 = None
+        if reference_wav2:
+            ref_for_model2 = prepare_reference_audio(reference_wav2, out_dir, max_seconds=float(args.max_ref_seconds))
+            reference_text2 = load_or_create_reference_text(
+                out_dir=out_dir,
+                ref_for_model=ref_for_model2,
+                transcript_filename=args.transcript_file2,
+                auto_transcribe=(not args.no_auto_transcribe),
+                asr_engine=args.asr_engine,
+                asr_model=args.asr_model,
+                asr_device=args.asr_device,
+                asr_compute_type=args.asr_compute_type,
+                max_transcript_words=int(args.max_transcript_words),
+                force_retranscribe=bool(args.force_retranscribe),
+            )
+            prompt_text2 = _build_prompt(reference_text2, args.prompt_prefix, args.max_transcript_words)
 
-    silence_chunk = _silence(cosyvoice.sample_rate, args.silence_ms)
-    output_chunks: list[torch.Tensor] = []
+        print(f"[INFO] Reference WAV:  {reference_wav}")
+        print(f"[INFO] Using ref WAV:  {ref_for_model}")
+        if reference_wav2:
+            print(f"[INFO] Reference2 WAV: {reference_wav2}")
+            print(f"[INFO] Using ref2 WAV: {ref_for_model2}")
+        print(f"[INFO] Model dir:      {model_dir}")
+        print(f"[INFO] Output path:    {out_wav}")
 
-    for idx, (voice_idx, utterance) in enumerate(script_segments, start=1):
-        if voice_idx == 2 and not (ref_for_model2 and prompt_text2):
-            raise RuntimeError("Script references V2, but no --reference2 was provided.")
+        cosyvoice = AutoModel(model_dir=str(model_dir))
 
-        active_ref = ref_for_model if voice_idx == 1 else ref_for_model2
-        active_prompt = prompt_text if voice_idx == 1 else prompt_text2
+        silence_chunk = _silence(cosyvoice.sample_rate, args.silence_ms)
+        output_chunks: list[torch.Tensor] = []
 
-        print(f"[INFO] Synthesizing turn {idx} (V{voice_idx}): {utterance[:60]}")
-        output_chunks.append(_generate_audio(cosyvoice, utterance, active_prompt, active_ref))
-        if idx < len(script_segments) and silence_chunk.numel() > 0:
-            output_chunks.append(silence_chunk)
+        for idx, (voice_idx, utterance) in enumerate(script_segments, start=1):
+            if voice_idx == 2 and not (ref_for_model2 and prompt_text2):
+                raise RuntimeError("Script references V2, but no --reference2 was provided.")
 
-    audio = concat_audio_chunks(output_chunks)
-    torchaudio.save(str(out_wav), audio, cosyvoice.sample_rate)
+            active_ref = ref_for_model if voice_idx == 1 else ref_for_model2
+            active_prompt = prompt_text if voice_idx == 1 else prompt_text2
+
+            print(f"[INFO] Synthesizing turn {idx} (V{voice_idx}): {utterance[:60]}")
+            output_chunks.append(_generate_audio(cosyvoice, utterance, active_prompt, active_ref))
+            if idx < len(script_segments) and silence_chunk.numel() > 0:
+                output_chunks.append(silence_chunk)
+
+        audio = concat_audio_chunks(output_chunks)
+        torchaudio.save(str(out_wav), audio, cosyvoice.sample_rate)
 
     if not out_wav.exists():
         raise RuntimeError(f"Output file was not created: {out_wav}")
