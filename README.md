@@ -10,7 +10,7 @@ python cosyvoice_cli.py --text "Hello world!" --reference "C:\\path\\to\\referen
 
 ## Two-voice CLI (scripted dialog)
 
-Use `cosyvoice-cli-twovoice.py` to generate a conversation with up to two voices. Provide the first reference via `--reference` and the second via `--reference2`.
+Use `cosyvoice-cli.py` to generate a conversation with up to two voices. Provide the first reference via `--reference` and the second via `--reference2`.
 
 If you **omit `--text`**, the script will load `voice_script.txt` from the repo root. The script supports optional prefixes:
 
@@ -30,19 +30,19 @@ V2: Absolutely. Let’s do it.
 Run with two voices and the default script file:
 
 ```bat
-python cosyvoice-cli-twovoice.py --reference "C:\\path\\to\\v1.wav" --reference2 "C:\\path\\to\\v2.wav"
+python cosyvoice-cli.py --reference "C:\\path\\to\\v1.wav" --reference2 "C:\\path\\to\\v2.wav"
 ```
 
 Run with inline text (no `voice_script.txt` needed):
 
 ```bat
-python cosyvoice-cli-twovoice.py --text "V1: Hello! V2: Hi there!" --reference "C:\\path\\to\\v1.wav" --reference2 "C:\\path\\to\\v2.wav"
+python cosyvoice-cli.py --text "V1: Hello! V2: Hi there!" --reference "C:\\path\\to\\v1.wav" --reference2 "C:\\path\\to\\v2.wav"
 ```
 
 Optional: add silence between turns (default 350ms):
 
 ```bat
-python cosyvoice-cli-twovoice.py --reference "C:\\path\\to\\v1.wav" --reference2 "C:\\path\\to\\v2.wav" --silence_ms 500
+python cosyvoice-cli.py --reference "C:\\path\\to\\v1.wav" --reference2 "C:\\path\\to\\v2.wav" --silence_ms 500
 ```
 
 ## What the CLI does
@@ -95,7 +95,6 @@ Fixes:
 
 This CLI adds:
 
-- `cosyvoice_cli.py` — the runnable script
-- `cosyvoice-cli-twovoice.py` — two-voice script runner (optional V1/V2)
+- `cosyvoice_cli.py` — the runnable script, including two-voice script runner (optional V1/V2)
 - `env/conda-windows-cpu.yml` — a reproducible conda environment for Windows CPU
 - `requirements-cli.txt` — the pip requirements used by that conda env
